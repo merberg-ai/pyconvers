@@ -1,16 +1,17 @@
 import socket
 import threading
+import datetime
 
+MY_CALLSIGN = "N0CALL-9"  # <-- Change this!
 KISS_FEND = 0xC0
 KISS_DATA = 0x00
 
-# Conference state
-conferences = {0: set()}  # Default conf 0
-user_channels = {}
-user_sockets = {}
+# State
+bbs_messages = []
+user_sessions = {}
+LOGFILE = open("ax25_log.txt", "a")
 
 def ax25_decode(frame):
-    """Decode AX.25 frame and return full metadata."""
     if len(frame) < 15:
         raise ValueError(f"Frame too short: {len(frame)} bytes")
 
@@ -25,37 +26,26 @@ def ax25_decode(frame):
     pid = frame[15] if len(frame) > 15 else None
     payload = frame[16:] if len(frame) > 16 else b''
 
-    # Determine control type
     if control == 0x03:
         ctrl_type = "UI"
     elif (control & 0x01) == 0x00:
         ctrl_type = "I"
     elif (control & 0x03) == 0x01:
         s_code = control & 0x0F
-        if s_code == 0x01:
-            ctrl_type = "RR"
-        elif s_code == 0x05:
-            ctrl_type = "REJ"
-        elif s_code == 0x09:
-            ctrl_type = "RNR"
-        elif s_code == 0x0D:
-            ctrl_type = "SREJ"
-        else:
-            ctrl_type = f"S(0x{control:02X})"
+        ctrl_type = {0x01: "RR", 0x05: "REJ", 0x09: "RNR", 0x0D: "SREJ"}.get(s_code, f"S(0x{control:02X})")
     else:
-        ctrl_type = f"UNKNOWN(0x{control:02X})"
+        ctrl_type = f"UNK(0x{control:02X})"
 
     return {
         'from': source,
         'to': dest,
         'type': ctrl_type,
         'pid': pid,
-        'payload': payload.decode(errors='ignore').replace('\r', '').replace('\x0d', '').strip(),
+        'payload': payload.decode(errors='ignore').replace('\r', '').strip(),
         'raw': frame
     }
 
 def kiss_unframe(data):
-    """Unwrap KISS frames from raw TCP data stream."""
     frames = []
     frame = bytearray()
     in_frame = False
@@ -64,7 +54,7 @@ def kiss_unframe(data):
         if byte == KISS_FEND:
             if in_frame and frame:
                 if frame[0] == KISS_DATA:
-                    frames.append(bytes(frame[1:]))  # strip port byte
+                    frames.append(bytes(frame[1:]))
                 frame = bytearray()
             in_frame = True
         else:
@@ -72,6 +62,14 @@ def kiss_unframe(data):
                 frame.append(byte)
 
     return frames
+
+def log_packet(from_call, to_call, ctrl_type, payload):
+    direction = "TX" if from_call == MY_CALLSIGN else "RX"
+    timestamp = datetime.datetime.now().isoformat()
+    logline = f"[{direction}] {from_call:9} > {to_call:9} [{ctrl_type:>3}] : {payload}"
+    print(logline)
+    LOGFILE.write(f"{timestamp} {logline}\n")
+    LOGFILE.flush()
 
 def handle_client(sock):
     buffer = bytearray()
@@ -93,16 +91,10 @@ def handle_client(sock):
                     ctrl_type = decoded['type']
                     payload = decoded['payload']
 
-                    # Print like axlisten
-                    if payload:
-                        print(f"{from_call:9} > {to_call:9} [{ctrl_type:>3}] : {payload}")
-                    else:
-                        print(f"{from_call:9} > {to_call:9} [{ctrl_type:>3}]")
+                    log_packet(from_call, to_call, ctrl_type, payload)
 
-                    # Handle convers-style commands
-                    if ctrl_type == "UI" and payload.startswith("/"):
-                        handle_convers_message(from_call, payload.strip(), sock)
-
+                    if ctrl_type == "UI" and payload:
+                        handle_bbs_input(from_call, payload)
                 except Exception as e:
                     print(f"[Frame Decode Error] {e}")
                     print(f"[Raw] {frame.hex()}")
@@ -112,42 +104,54 @@ def handle_client(sock):
             print(f"[Socket Error] {e}")
             break
 
-def handle_convers_message(callsign, message, sock):
-    if callsign not in user_channels:
-        user_channels[callsign] = 0
-        conferences[0].add(callsign)
-        user_sockets[callsign] = sock
-        print(f"[+] {callsign} joined conf 0")
+def handle_bbs_input(callsign, payload):
+    session = user_sessions.setdefault(callsign, {'state': 'idle', 'msg_lines': []})
 
-    conf = user_channels[callsign]
+    if session['state'] == 'writing':
+        if payload == ".":
+            message = '\n'.join(session['msg_lines'])
+            bbs_messages.append((callsign, message, datetime.datetime.now()))
+            send_line(callsign, "Message saved.\n")
+            session['msg_lines'].clear()
+            session['state'] = 'idle'
+        else:
+            session['msg_lines'].append(payload)
+        return
 
-    if message.startswith("/join "):
+    cmd = payload.strip().upper()
+
+    if cmd == '?':
+        send_line(callsign, "Commands: I = Info, L = List, R # = Read, S = Send, Q = Quit, ? = Help")
+    elif cmd == 'I':
+        send_line(callsign, f"Welcome {callsign}. This is RetroPy BBS 1.0")
+    elif cmd == 'L':
+        if not bbs_messages:
+            send_line(callsign, "No messages.")
+        else:
+            for i, (sender, _, ts) in enumerate(bbs_messages):
+                send_line(callsign, f"{i+1:03d}) {sender} @ {ts.strftime('%H:%M %b %d')}")
+    elif cmd.startswith('R '):
         try:
-            new_conf = int(message.split()[1])
-            conferences.setdefault(new_conf, set()).add(callsign)
-            conferences[conf].discard(callsign)
-            user_channels[callsign] = new_conf
-            send_to_user(callsign, f"You joined conference {new_conf}")
-        except ValueError:
-            send_to_user(callsign, "Usage: /join <number>")
-
-    elif message.startswith("/who"):
-        members = ', '.join(sorted(conferences.get(conf, [])))
-        send_to_user(callsign, f"Users in conf {conf}: {members}")
-
+            index = int(cmd.split()[1]) - 1
+            if 0 <= index < len(bbs_messages):
+                sender, msg, ts = bbs_messages[index]
+                send_line(callsign, f"From: {sender}\nDate: {ts}\n\n{msg}")
+            else:
+                send_line(callsign, "Invalid message number.")
+        except:
+            send_line(callsign, "Usage: R <message number>")
+    elif cmd == 'S':
+        send_line(callsign, "Enter your message. End with a single dot (.) on its own line.")
+        session['state'] = 'writing'
+        session['msg_lines'] = []
+    elif cmd == 'Q':
+        send_line(callsign, "Bye.\n")
+        del user_sessions[callsign]
     else:
-        broadcast(conf, f"<{callsign}> {message}", exclude=callsign)
+        send_line(callsign, f"Unknown command: {payload}")
 
-def send_to_user(callsign, message):
-    sock = user_sockets.get(callsign)
-    if sock:
-        print(f"[to {callsign}] {message}")
-        # TODO: implement sending back via AX.25 if desired
-
-def broadcast(conf, message, exclude=None):
-    for user in conferences.get(conf, []):
-        if user != exclude:
-            send_to_user(user, message)
+def send_line(callsign, message):
+    print(f"[to {callsign}] {message.strip()}")  # Placeholder — not sending back over AX.25 (yet)
 
 def start_server(host='127.0.0.1', port=8001):
     print(f"Connecting to Direwolf on {host}:{port}...")
